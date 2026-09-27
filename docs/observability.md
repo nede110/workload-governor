@@ -147,3 +147,11 @@ XRAY_ENABLED=true AWS_XRAY_DAEMON_ADDRESS=127.0.0.1:2000 npm run dev
 ```
 
 Segments appear in the [X-Ray console](https://console.aws.amazon.com/xray/home) within ~30 seconds.
+
+---
+
+## Runbooks
+
+| Runbook | Description |
+|---|---|
+| [Redis Cache Failure](runbooks/redis-failure.md) | Redis unreachable, mass key eviction, cache flush, cluster resizing, and recovery verification |
