@@ -172,8 +172,27 @@ interface RpcEvent {
   /** ISO-8601 creation timestamp */
   createdAt: string;
   txHash?: string;
+  /** Hash of this ledger — used to track the confirmed chain tip. */
+  ledgerHash?: string;
+  /** Hash of the parent (previous) ledger — used for reorg detection. */
+  parentLedgerHash?: string;
   topic: Array<{ type: string; xdr: string }>;
   value: { type: string; xdr: string };
+}
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * Running total of ledger reorganizations detected by the indexer.
+ * Equivalent to the Prometheus counter `indexer_reorg_detected_total`.
+ */
+let indexerReorgDetectedTotal = 0;
+
+/** Return the current value of the reorg detection counter. */
+export function getReorgDetectedTotal(): number {
+  return indexerReorgDetectedTotal;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +204,10 @@ export class EventIndexer {
   /** Paging cursor for the next RPC call. Undefined means start from resume ledger. */
   private cursor: string | undefined;
   private isRunning = false;
+  /** Ledger hash of the last successfully processed batch — used for reorg detection. */
+  private lastConfirmedLedgerHash: string | undefined = undefined;
+  /** Ledger sequence of the last successfully processed batch. */
+  private lastConfirmedLedger: number = 0;
 
   constructor() {
     this.server = new SorobanRpc.Server(RPC_URL, { allowHttp: true });
@@ -256,6 +279,37 @@ export class EventIndexer {
 
   // ── Poll loop ────────────────────────────────────────────────────────────
 
+  /**
+   * Roll back events from orphaned ledgers after a chain reorganization.
+   *
+   * Deletes all `contract_events` rows whose `ledger_seq` is strictly greater
+   * than `commonAncestorLedger` in a single atomic database transaction.
+   * After a successful rollback the cursor is reset to re-index from the safe
+   * ancestor ledger.
+   */
+  private async rollbackToLedger(commonAncestorLedger: number): Promise<void> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        'DELETE FROM contract_events WHERE ledger_seq > $1',
+        [commonAncestorLedger],
+      );
+      await client.query('COMMIT');
+      const deleted = (result as { rowCount?: number }).rowCount ?? 0;
+      logger.warn({
+        message: 'Rolled back orphaned ledger events',
+        commonAncestorLedger,
+        deletedRows: deleted,
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   private async pollForEvents(): Promise<void> {
     while (this.isRunning) {
       try {
@@ -271,6 +325,46 @@ export class EventIndexer {
         });
 
         const events = response.events as unknown as RpcEvent[];
+
+        // ── Reorg detection ───────────────────────────────────────────────
+        // Compare the parentLedgerHash of the first event's ledger against
+        // the last confirmed hash we have stored. A mismatch means the RPC
+        // node reorganized and we must roll back orphaned events before
+        // re-indexing from the safe ancestor ledger.
+        if (events.length > 0 && this.lastConfirmedLedgerHash !== undefined) {
+          const firstEvent = events[0];
+          const firstLedger = parseInt(firstEvent.ledger, 10);
+          const parentHash = firstEvent.parentLedgerHash;
+
+          if (
+            parentHash !== undefined &&
+            firstLedger === this.lastConfirmedLedger + 1 &&
+            parentHash !== this.lastConfirmedLedgerHash
+          ) {
+            // Hash mismatch — ledger reorganization detected.
+            indexerReorgDetectedTotal++;
+            logger.warn({
+              message: 'Ledger reorganization detected',
+              expectedParentHash: this.lastConfirmedLedgerHash,
+              actualParentHash: parentHash,
+              reorgAtLedger: firstLedger,
+              metric: 'indexer_reorg_detected_total',
+              metricValue: indexerReorgDetectedTotal,
+            });
+
+            // Roll back to the ledger just before the divergence point.
+            await this.rollbackToLedger(this.lastConfirmedLedger - 1);
+
+            // Reset cursor so we re-index from before the reorg.
+            this.cursor = String(Math.max(0, this.lastConfirmedLedger - 1));
+            this.lastConfirmedLedgerHash = undefined;
+            this.lastConfirmedLedger = 0;
+
+            // Re-poll immediately after rollback without sleeping.
+            continue;
+          }
+        }
+        // ── End reorg detection ───────────────────────────────────────────
 
         if (events.length > 0) {
           let persisted = 0;
@@ -290,6 +384,13 @@ export class EventIndexer {
           // Advance cursor to the last event's pagingToken
           const last = events[events.length - 1];
           this.cursor = last.pagingToken ?? last.id;
+
+          // Track the latest confirmed ledger hash for reorg detection on the
+          // next poll cycle.
+          if (last.ledgerHash !== undefined) {
+            this.lastConfirmedLedgerHash = last.ledgerHash;
+            this.lastConfirmedLedger = parseInt(last.ledger, 10);
+          }
 
           logger.info({
             message: 'Indexed event batch',
