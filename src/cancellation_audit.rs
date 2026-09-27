@@ -2,8 +2,19 @@
 ///
 /// Persists off-chain cancellation events with timestamps, subscription
 /// metadata, and an optional reason so merchants have a queryable history.
+///
+/// Per-contributor history is bounded to [`MAX_AUDIT_HISTORY_PER_USER`] entries
+/// using ring-buffer semantics: the oldest record is evicted when the cap is
+/// reached, keeping persistent storage rent constant per active contributor.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Maximum number of cancellation audit records retained per contributor.
+///
+/// When a new record would exceed this ceiling the oldest existing record for
+/// that contributor is removed before the new one is inserted, maintaining
+/// ring-buffer semantics and a constant storage footprint.
+pub const MAX_AUDIT_HISTORY_PER_USER: u32 = 50;
 
 /// The reason a subscription was cancelled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +58,13 @@ pub trait AuditStore: Send + Sync {
         &self,
         contributor: &str,
     ) -> Result<Vec<CancellationRecord>, AuditError>;
+    /// Return the number of audit records stored for a specific contributor.
+    fn count_by_contributor(&self, contributor: &str) -> Result<u32, AuditError>;
+    /// Remove the oldest audit record for a contributor (ring-buffer eviction).
+    ///
+    /// "Oldest" is determined by `cancelled_at`. When multiple records share
+    /// the same timestamp the implementation may remove any one of them.
+    fn remove_oldest_for_contributor(&self, contributor: &str) -> Result<(), AuditError>;
 }
 
 #[derive(Debug)]
@@ -75,6 +93,11 @@ impl<S: AuditStore> CancellationAuditService<S> {
     }
 
     /// Record a new cancellation event.
+    ///
+    /// Before inserting, the per-contributor history is checked against
+    /// [`MAX_AUDIT_HISTORY_PER_USER`]. If the cap is reached, the oldest
+    /// record for the contributor is evicted to maintain ring-buffer semantics
+    /// and keep the persistent storage footprint constant.
     pub fn record(
         &self,
         org_id: impl Into<String>,
@@ -94,6 +117,13 @@ impl<S: AuditStore> CancellationAuditService<S> {
             reason,
             tx_hash,
         };
+
+        // Enforce per-contributor history cap (ring-buffer semantics).
+        let count = self.store.count_by_contributor(&record.contributor)?;
+        if count >= MAX_AUDIT_HISTORY_PER_USER {
+            self.store.remove_oldest_for_contributor(&record.contributor)?;
+        }
+
         self.store.insert(&record)?;
         Ok(record)
     }
@@ -125,6 +155,7 @@ mod tests {
             self.0.lock().unwrap().push(record.clone());
             Ok(())
         }
+
         fn list_by_org(&self, org_id: &str) -> Result<Vec<CancellationRecord>, AuditError> {
             Ok(self
                 .0
@@ -135,6 +166,7 @@ mod tests {
                 .cloned()
                 .collect())
         }
+
         fn list_by_contributor(
             &self,
             contributor: &str,
@@ -147,6 +179,37 @@ mod tests {
                 .filter(|r| r.contributor == contributor)
                 .cloned()
                 .collect())
+        }
+
+        fn count_by_contributor(&self, contributor: &str) -> Result<u32, AuditError> {
+            let count = self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.contributor == contributor)
+                .count();
+            Ok(count as u32)
+        }
+
+        fn remove_oldest_for_contributor(&self, contributor: &str) -> Result<(), AuditError> {
+            let mut store = self.0.lock().unwrap();
+            // Find the index of the entry with the earliest `cancelled_at` for
+            // this contributor.
+            let oldest_idx = store
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.contributor == contributor)
+                .min_by_key(|(_, r)| r.cancelled_at)
+                .map(|(i, _)| i);
+
+            match oldest_idx {
+                Some(idx) => {
+                    store.remove(idx);
+                    Ok(())
+                }
+                None => Err(AuditError::RecordNotFound),
+            }
         }
     }
 
@@ -181,5 +244,23 @@ mod tests {
         s.record("org-1", 2, "G1", "G2", None, None).unwrap();
         s.record("org-1", 3, "G9", "G2", None, None).unwrap();
         assert_eq!(s.history_for_contributor("G1").unwrap().len(), 2);
+    }
+
+    /// Inserting more than MAX_AUDIT_HISTORY_PER_USER records for a single
+    /// contributor must not grow the stored history beyond the cap.
+    ///
+    /// After 100 consecutive cancellations the contributor's history must
+    /// contain exactly MAX_AUDIT_HISTORY_PER_USER (50) entries — the oldest
+    /// are evicted in ring-buffer fashion to keep storage rent constant.
+    #[test]
+    fn bounded_history_stays_at_50() {
+        let s = svc();
+        // Insert 100 records for the same contributor
+        for i in 0..100u64 {
+            s.record("org-1", i, "G1", "G2", None, None).unwrap();
+        }
+        // History must be capped at MAX_AUDIT_HISTORY_PER_USER
+        let history = s.history_for_contributor("G1").unwrap();
+        assert_eq!(history.len(), MAX_AUDIT_HISTORY_PER_USER as usize);
     }
 }
